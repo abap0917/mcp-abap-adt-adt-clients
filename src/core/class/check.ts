@@ -1,0 +1,269 @@
+/**
+ * Class check operations
+ */
+
+import type {
+  IAdtResponse as AxiosResponse,
+  IAbapConnection,
+} from '@mcp-abap-adt/interfaces';
+import {
+  ACCEPT_CHECK_MESSAGES,
+  CT_CHECK_OBJECTS,
+} from '../../constants/contentTypes';
+
+/**
+ * Check class code (syntax, compilation, rules)
+ *
+ * CheckRun validates everything: syntax, compilation errors, warnings, code quality rules.
+ *
+ * Can check:
+ * - Existing active class: provide className, version='active', omit sourceCode
+ * - Existing inactive class: provide className, version='inactive', omit sourceCode
+ * - Hypothetical code: provide className, sourceCode, version (object doesn't need to exist)
+ *
+ * @param connection - SAP connection
+ * @param className - Class name
+ * @param version - 'active' (activated version) or 'inactive' (saved but not activated)
+ * @param sourceCode - Optional: source code to validate. If provided, validates hypothetical code without creating object
+ * @returns Check result with errors/warnings
+ */
+export async function checkClass(
+  connection: IAbapConnection,
+  className: string,
+  version: 'active' | 'inactive',
+  sourceCode?: string,
+  artifactContentType?: string,
+): Promise<AxiosResponse> {
+  const { runCheckRun, runCheckRunWithSource, parseCheckRunResponse } =
+    await import('../../utils/checkRun');
+
+  let response: AxiosResponse;
+
+  if (sourceCode) {
+    // Validate hypothetical code (object doesn't need to exist)
+    response = await runCheckRunWithSource(
+      connection,
+      'class',
+      className,
+      sourceCode,
+      version,
+      'abapCheckRun',
+      artifactContentType,
+    );
+  } else {
+    // Validate existing object in SAP (reads from system)
+    response = await runCheckRun(
+      connection,
+      'class',
+      className,
+      version,
+      'abapCheckRun',
+    );
+  }
+
+  const checkResult = parseCheckRunResponse(response);
+
+  if (checkResult.has_errors) {
+    const errorMessages = checkResult.errors.map((err) => err.text).join('; ');
+    throw new Error(`Class check failed: ${errorMessages}`);
+  }
+
+  return response;
+}
+
+/**
+ * Check class local test class code (syntax, compilation, rules)
+ *
+ * Validates ABAP Unit test classes in the testclasses include.
+ * This is separate from main class check because test classes use a different URI.
+ *
+ * @param connection - SAP connection
+ * @param className - Class name (container class for the test)
+ * @param testClassSource - Test class source code to validate
+ * @param version - 'active' (activated version) or 'inactive' (saved but not activated)
+ * @returns Check result with errors/warnings
+ * @throws Error if check finds errors (chkrun:type="E")
+ */
+export async function checkClassLocalTestClass(
+  connection: IAbapConnection,
+  className: string,
+  testClassSource: string,
+  version: 'active' | 'inactive' = 'inactive',
+  artifactContentType: string = 'text/plain; charset=utf-8',
+): Promise<AxiosResponse> {
+  return checkClassInclude(
+    connection,
+    className,
+    testClassSource,
+    'testclasses',
+    version,
+    'Test class',
+    artifactContentType,
+  );
+}
+
+/**
+ * Check class local types (implementations include)
+ *
+ * Validates local helper classes, interface definitions and type declarations
+ * in the implementations include file.
+ *
+ * @param connection - SAP connection
+ * @param className - Class name
+ * @param localTypesSource - Local types source code to validate
+ * @param version - 'active' or 'inactive'
+ * @returns Check result with errors/warnings
+ * @throws Error if check finds errors (chkrun:type="E")
+ */
+export async function checkClassLocalTypes(
+  connection: IAbapConnection,
+  className: string,
+  localTypesSource: string,
+  version: 'active' | 'inactive' = 'inactive',
+  artifactContentType: string = 'text/plain; charset=utf-8',
+): Promise<AxiosResponse> {
+  return checkClassInclude(
+    connection,
+    className,
+    localTypesSource,
+    'implementations',
+    version,
+    'Local types',
+    artifactContentType,
+  );
+}
+
+/**
+ * Check class-relevant local types (definitions include)
+ *
+ * Validates type declarations needed for components in the private section
+ * in the definitions include file.
+ *
+ * @param connection - SAP connection
+ * @param className - Class name
+ * @param definitionsSource - Definitions source code to validate
+ * @param version - 'active' or 'inactive'
+ * @returns Check result with errors/warnings
+ * @throws Error if check finds errors (chkrun:type="E")
+ */
+export async function checkClassDefinitions(
+  connection: IAbapConnection,
+  className: string,
+  definitionsSource: string,
+  version: 'active' | 'inactive' = 'inactive',
+  artifactContentType: string = 'text/plain; charset=utf-8',
+): Promise<AxiosResponse> {
+  return checkClassInclude(
+    connection,
+    className,
+    definitionsSource,
+    'definitions',
+    version,
+    'Definitions',
+    artifactContentType,
+  );
+}
+
+/**
+ * Check class macros
+ *
+ * Validates macro definitions needed in the implementation part of the class.
+ * Note: Macros are supported in older ABAP versions but not in newer ones.
+ *
+ * @param connection - SAP connection
+ * @param className - Class name
+ * @param macrosSource - Macros source code to validate
+ * @param version - 'active' or 'inactive'
+ * @returns Check result with errors/warnings
+ * @throws Error if check finds errors (chkrun:type="E")
+ */
+export async function checkClassMacros(
+  connection: IAbapConnection,
+  className: string,
+  macrosSource: string,
+  version: 'active' | 'inactive' = 'inactive',
+  artifactContentType: string = 'text/plain; charset=utf-8',
+): Promise<AxiosResponse> {
+  return checkClassInclude(
+    connection,
+    className,
+    macrosSource,
+    'macros',
+    version,
+    'Macros',
+    artifactContentType,
+  );
+}
+
+/**
+ * Generic function to check any class include file
+ *
+ * @param connection - SAP connection
+ * @param className - Class name
+ * @param includeSource - Include source code to validate
+ * @param includeType - Type of include (implementations, definitions, macros, testclasses)
+ * @param version - 'active' or 'inactive'
+ * @param includeName - Human-readable name for error messages
+ * @returns Check result with errors/warnings
+ * @throws Error if check finds errors (chkrun:type="E")
+ */
+async function checkClassInclude(
+  connection: IAbapConnection,
+  className: string,
+  includeSource: string,
+  includeType: 'implementations' | 'definitions' | 'macros' | 'testclasses',
+  version: 'active' | 'inactive' = 'inactive',
+  includeName: string,
+  artifactContentType: string = 'text/plain; charset=utf-8',
+): Promise<AxiosResponse> {
+  const { getTimeout } = await import('../../utils/timeouts');
+  const { encodeSapObjectName } = await import('../../utils/internalUtils');
+  const { parseCheckRunResponse } = await import('../../utils/checkRun');
+
+  const encodedName = encodeSapObjectName(className.toLowerCase());
+  const objectUri = `/sap/bc/adt/oo/classes/${encodedName}`;
+  const includeUri = `${objectUri}/includes/${includeType}`;
+
+  // Encode source to base64
+  const base64Source = Buffer.from(includeSource, 'utf-8').toString('base64');
+
+  // Build XML with include artifact
+  const xmlBody = `<?xml version="1.0" encoding="UTF-8"?><chkrun:checkObjectList xmlns:chkrun="http://www.sap.com/adt/checkrun" xmlns:adtcore="http://www.sap.com/adt/core">
+  <chkrun:checkObject adtcore:uri="${objectUri}" chkrun:version="${version}">
+    <chkrun:artifacts>
+      <chkrun:artifact chkrun:contentType="${artifactContentType}" chkrun:uri="${includeUri}">
+        <chkrun:content>${base64Source}</chkrun:content>
+      </chkrun:artifact>
+    </chkrun:artifacts>
+  </chkrun:checkObject>
+</chkrun:checkObjectList>`;
+
+  const headers = {
+    Accept: ACCEPT_CHECK_MESSAGES,
+    'Content-Type': CT_CHECK_OBJECTS,
+  };
+
+  const url = `/sap/bc/adt/checkruns?reporters=abapCheckRun`;
+
+  const response = await connection.makeAdtRequest({
+    url,
+    method: 'POST',
+    timeout: getTimeout('default'),
+    data: xmlBody,
+    headers,
+  });
+
+  const checkResult = parseCheckRunResponse(response);
+
+  if (checkResult.has_errors) {
+    const errorMessages =
+      checkResult.errors.length > 0
+        ? checkResult.errors
+            .map((err: { text?: string }) => err.text)
+            .join('; ')
+        : `status=${checkResult.status}, message=${checkResult.message || 'none'}`;
+    throw new Error(`${includeName} check failed: ${errorMessages}`);
+  }
+
+  return response;
+}
