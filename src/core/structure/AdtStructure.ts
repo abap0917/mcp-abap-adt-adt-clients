@@ -1,0 +1,611 @@
+/**
+ * AdtStructure - High-level CRUD operations for Structure objects
+ *
+ * Implements IAdtObject interface with automatic operation chains,
+ * error handling, and resource cleanup.
+ *
+ * Uses low-level functions directly (not Builder classes).
+ *
+ * Session management:
+ * - stateful: only when doing lock/update/unlock operations
+ * - stateless: obligatory after unlock
+ * - If no lock/unlock, no stateful needed
+ * - activate uses same session/cookies (no stateful needed)
+ *
+ * Operation chains:
+ * - Create: validate → create → check → lock → check(inactive) → update → unlock → check → activate
+ * - Update: lock → check(inactive) → update → unlock → check → activate
+ * - Delete: check(deletion) → delete
+ */
+
+import type {
+  HttpError,
+  IAbapConnection,
+  IAdtObject,
+  IAdtOperationOptions,
+  ILogger,
+} from '@mcp-abap-adt/interfaces';
+import type { IAdtSystemContext } from '../../clients/AdtClient';
+import { safeErrorMessage } from '../../utils/internalUtils';
+import type { IReadOptions } from '../shared/types';
+import { activateStructure } from './activation';
+import { checkStructure } from './check';
+import { create as createStructure } from './create';
+import { checkDeletion, deleteStructure } from './delete';
+import { lockStructure } from './lock';
+import {
+  getStructureMetadata,
+  getStructureSource,
+  getStructureTransport,
+} from './read';
+import type { IStructureConfig, IStructureState } from './types';
+import { unlockStructure } from './unlock';
+import { upload } from './update';
+import { validateStructureName } from './validation';
+
+import { getStructureVersionSource, getStructureVersions } from './versions';
+export class AdtStructure
+  implements IAdtObject<IStructureConfig, IStructureState>
+{
+  private readonly connection: IAbapConnection;
+  private readonly logger?: ILogger;
+  private readonly systemContext: IAdtSystemContext;
+  public readonly objectType: string = 'Structure';
+
+  constructor(
+    connection: IAbapConnection,
+    logger?: ILogger,
+    systemContext?: IAdtSystemContext,
+  ) {
+    this.connection = connection;
+    this.logger = logger;
+    this.systemContext = systemContext ?? {};
+  }
+
+  /**
+   * Validate structure configuration before creation
+   */
+  async validate(config: Partial<IStructureConfig>): Promise<IStructureState> {
+    if (!config.structureName) {
+      throw new Error('Structure name is required for validation');
+    }
+
+    const state: IStructureState = { errors: [] };
+    try {
+      const response = await validateStructureName(
+        this.connection,
+        config.structureName,
+        config.description,
+      );
+      state.validationResponse = response;
+      return state;
+    } catch (error: unknown) {
+      state.errors.push({
+        method: 'validate',
+        error: error instanceof Error ? error : new Error(String(error)),
+        timestamp: new Date(),
+      });
+      this.logger?.error('validate failed:', safeErrorMessage(error));
+      throw error;
+    }
+  }
+
+  /**
+   * Create structure metadata only
+   * Use update() to upload DDL code after creation
+   */
+  async create(
+    config: IStructureConfig,
+    options?: IAdtOperationOptions,
+  ): Promise<IStructureState> {
+    if (!config.structureName) {
+      throw new Error('Structure name is required');
+    }
+    if (!config.packageName) {
+      throw new Error('Package name is required');
+    }
+    if (!config.description) {
+      throw new Error('Description is required');
+    }
+
+    let objectCreated = false;
+    const state: IStructureState = {
+      errors: [],
+    };
+
+    try {
+      // Create structure
+      this.logger?.info?.('Creating structure');
+      const createResponse = await createStructure(this.connection, {
+        structureName: config.structureName,
+        packageName: config.packageName,
+        transportRequest: config.transportRequest,
+        description: config.description,
+        masterSystem: this.systemContext.masterSystem,
+        responsible: this.systemContext.responsible,
+        masterLanguage:
+          config.masterLanguage ?? this.systemContext.masterLanguage,
+      });
+      objectCreated = true;
+      state.createResult = createResponse;
+      this.logger?.info?.('Structure created');
+
+      return state;
+    } catch (error: unknown) {
+      if (objectCreated && options?.deleteOnFailure) {
+        try {
+          this.logger?.warn?.('Deleting structure after failure');
+          await deleteStructure(this.connection, {
+            structure_name: config.structureName,
+            transport_request: config.transportRequest,
+          });
+        } catch (deleteError) {
+          this.logger?.warn?.(
+            'Failed to delete structure after failure:',
+            safeErrorMessage(deleteError),
+          );
+        }
+      }
+
+      this.logger?.error('Create failed:', safeErrorMessage(error));
+      throw error;
+    }
+  }
+
+  /**
+   * Read structure
+   */
+  async read(
+    config: Partial<IStructureConfig>,
+    version?: 'active' | 'inactive',
+    options?: IReadOptions,
+  ): Promise<IStructureState | undefined> {
+    if (!config.structureName) {
+      throw new Error('Structure name is required');
+    }
+
+    try {
+      const response = await getStructureSource(
+        this.connection,
+        config.structureName,
+        version,
+        options,
+      );
+      return {
+        readResult: response,
+        errors: [],
+      };
+    } catch (error: unknown) {
+      const e = error as HttpError;
+      if (e.response?.status === 404) {
+        return undefined;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Read structure metadata (object characteristics: package, responsible, description, etc.)
+   */
+  async readMetadata(
+    config: Partial<IStructureConfig>,
+    options?: IReadOptions,
+  ): Promise<IStructureState> {
+    const state: IStructureState = { errors: [] };
+    if (!config.structureName) {
+      const error = new Error('Structure name is required');
+      state.errors.push({
+        method: 'readMetadata',
+        error,
+        timestamp: new Date(),
+      });
+      throw error;
+    }
+    try {
+      const response = await getStructureMetadata(
+        this.connection,
+        config.structureName,
+        options,
+      );
+      state.metadataResult = response;
+      this.logger?.info?.('Structure metadata read successfully');
+      return state;
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      state.errors.push({
+        method: 'readMetadata',
+        error: err,
+        timestamp: new Date(),
+      });
+      this.logger?.error('readMetadata', safeErrorMessage(err));
+      throw err;
+    }
+  }
+
+  /**
+   * Read transport request information for the structure
+   */
+  async readTransport(
+    config: Partial<IStructureConfig>,
+    options?: { withLongPolling?: boolean },
+  ): Promise<IStructureState> {
+    const state: IStructureState = { errors: [] };
+    if (!config.structureName) {
+      const error = new Error('Structure name is required');
+      state.errors.push({
+        method: 'readTransport',
+        error,
+        timestamp: new Date(),
+      });
+      throw error;
+    }
+    try {
+      const response = await getStructureTransport(
+        this.connection,
+        config.structureName,
+        options?.withLongPolling !== undefined
+          ? { withLongPolling: options.withLongPolling }
+          : undefined,
+      );
+      state.transportResult = response;
+      this.logger?.info?.('Structure transport request read successfully');
+      return state;
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      state.errors.push({
+        method: 'readTransport',
+        error: err,
+        timestamp: new Date(),
+      });
+      this.logger?.error('readTransport', safeErrorMessage(err));
+      throw err;
+    }
+  }
+
+  /**
+   * Update structure with full operation chain
+   * Always starts with lock
+   * If options.low is true, performs only low-level update without lock/check/unlock chain
+   */
+  async update(
+    config: Partial<IStructureConfig>,
+    options?: IAdtOperationOptions,
+  ): Promise<IStructureState> {
+    if (!config.structureName) {
+      throw new Error('Structure name is required');
+    }
+
+    // Low-level mode: if lockHandle is provided, perform only update operation
+    if (options?.lockHandle) {
+      const codeToUpdate = options?.sourceCode || config.ddlCode;
+      if (!codeToUpdate) {
+        throw new Error('Source code (ddlCode) is required for update');
+      }
+
+      this.logger?.info?.(
+        'Low-level update: performing update only (lockHandle provided)',
+      );
+      const updateResponse = await upload(
+        this.connection,
+        {
+          structureName: config.structureName,
+          ddlCode: codeToUpdate,
+          transportRequest: config.transportRequest,
+        },
+        options.lockHandle,
+      );
+      this.logger?.info?.('Structure updated (low-level)');
+      return {
+        updateResult: updateResponse,
+        errors: [],
+      };
+    }
+
+    let lockHandle: string | undefined;
+
+    try {
+      // 1. Lock (update always starts with lock, stateful ONLY before lock)
+      this.logger?.info?.('Step 1: Locking structure');
+      this.connection.setSessionType('stateful');
+      lockHandle = await lockStructure(this.connection, config.structureName);
+      this.logger?.info?.('Structure locked, handle:', lockHandle);
+
+      // 2. Check inactive with code for update (from options or config)
+      const codeToCheck = options?.sourceCode || config.ddlCode;
+      if (codeToCheck) {
+        this.logger?.info?.(
+          'Step 2: Checking inactive version with update content',
+        );
+        await checkStructure(
+          this.connection,
+          config.structureName,
+          'inactive',
+          codeToCheck,
+          this.logger,
+        );
+        this.logger?.info?.('Check inactive with update content passed');
+      }
+
+      // 3. Update
+      if (codeToCheck && lockHandle) {
+        this.logger?.info?.('Step 3: Updating structure');
+        await upload(
+          this.connection,
+          {
+            structureName: config.structureName,
+            ddlCode: codeToCheck,
+            transportRequest: config.transportRequest,
+          },
+          lockHandle,
+        );
+        this.logger?.info?.('Structure updated');
+
+        // 3.5. Read with long polling to ensure object is ready after update
+        this.logger?.info?.('read (wait for object ready after update)');
+        try {
+          await this.read({ structureName: config.structureName }, 'active', {
+            withLongPolling: true,
+          });
+          this.logger?.info?.('object is ready after update');
+        } catch (readError) {
+          this.logger?.warn?.(
+            'read with long polling failed after update:',
+            safeErrorMessage(readError),
+          );
+          // Continue anyway - unlock might still work
+        }
+      }
+
+      // 4. Unlock (obligatory stateless after unlock)
+      if (lockHandle) {
+        this.logger?.info?.('Step 4: Unlocking structure');
+        this.connection.setSessionType('stateful');
+        await unlockStructure(
+          this.connection,
+          config.structureName,
+          lockHandle,
+        );
+        this.connection.setSessionType('stateless');
+        lockHandle = undefined;
+        this.logger?.info?.('Structure unlocked');
+      }
+
+      // 5. Final check (no stateful needed)
+      this.logger?.info?.('Step 5: Final check');
+      await checkStructure(
+        this.connection,
+        config.structureName,
+        'inactive',
+        undefined,
+        this.logger,
+      );
+      this.logger?.info?.('Final check passed');
+
+      // 6. Activate (if requested, no stateful needed - uses same session/cookies)
+      if (options?.activateOnUpdate) {
+        this.logger?.info?.('Step 6: Activating structure');
+        const activateResponse = await activateStructure(
+          this.connection,
+          config.structureName,
+        );
+        this.logger?.info?.(
+          'Structure activated, status:',
+          activateResponse.status,
+        );
+
+        // 6.5. Read with long polling to ensure object is ready after activation
+        this.logger?.info?.('read (wait for object ready after activation)');
+        try {
+          const readState = await this.read(
+            { structureName: config.structureName },
+            'active',
+            { withLongPolling: true },
+          );
+          if (readState) {
+            return {
+              activateResult: activateResponse,
+              readResult: readState.readResult,
+              errors: [],
+            };
+          }
+          this.logger?.info?.('object is ready after activation');
+        } catch (readError) {
+          this.logger?.warn?.(
+            'read with long polling failed after activation:',
+            safeErrorMessage(readError),
+          );
+          // Continue anyway - activation was successful
+        }
+        return {
+          activateResult: activateResponse,
+          errors: [],
+        };
+      }
+
+      // Read and return result (no stateful needed)
+      const readResponse = await getStructureSource(
+        this.connection,
+        config.structureName,
+        'inactive',
+      );
+      return {
+        readResult: readResponse,
+        errors: [],
+      };
+    } catch (error: unknown) {
+      // Cleanup on error - unlock if locked (lockHandle saved for force unlock)
+      if (lockHandle) {
+        try {
+          this.logger?.warn?.('Unlocking structure during error cleanup');
+          this.connection.setSessionType('stateful');
+          await unlockStructure(
+            this.connection,
+            config.structureName,
+            lockHandle,
+          );
+          this.connection.setSessionType('stateless');
+        } catch (unlockError) {
+          this.logger?.warn?.(
+            'Failed to unlock during cleanup:',
+            safeErrorMessage(unlockError),
+          );
+        }
+      } else {
+        // Ensure stateless if lock failed
+        this.connection.setSessionType('stateless');
+      }
+
+      if (options?.deleteOnFailure) {
+        try {
+          this.logger?.warn?.('Deleting structure after failure');
+          // No stateful needed - delete doesn't use lock/unlock
+          await deleteStructure(this.connection, {
+            structure_name: config.structureName,
+            transport_request: config.transportRequest,
+          });
+        } catch (deleteError) {
+          this.logger?.warn?.(
+            'Failed to delete structure after failure:',
+            safeErrorMessage(deleteError),
+          );
+        }
+      }
+
+      this.logger?.error('Update failed:', safeErrorMessage(error));
+      throw error;
+    }
+  }
+
+  /**
+   * Delete structure
+   */
+  async delete(config: Partial<IStructureConfig>): Promise<IStructureState> {
+    if (!config.structureName) {
+      throw new Error('Structure name is required');
+    }
+
+    try {
+      // Check for deletion (no stateful needed)
+      this.logger?.info?.('Checking structure for deletion');
+      await checkDeletion(this.connection, {
+        structure_name: config.structureName,
+        transport_request: config.transportRequest,
+      });
+      this.logger?.info?.('Deletion check passed');
+
+      // Delete (no stateful needed - no lock/unlock)
+      this.logger?.info?.('Deleting structure');
+      const result = await deleteStructure(this.connection, {
+        structure_name: config.structureName,
+        transport_request: config.transportRequest,
+      });
+      this.logger?.info?.('Structure deleted');
+
+      return {
+        deleteResult: result,
+        errors: [],
+      };
+    } catch (error: unknown) {
+      this.logger?.error('Delete failed:', safeErrorMessage(error));
+      throw error;
+    }
+  }
+
+  /**
+   * Activate structure
+   * No stateful needed - uses same session/cookies
+   */
+  async activate(config: Partial<IStructureConfig>): Promise<IStructureState> {
+    if (!config.structureName) {
+      throw new Error('Structure name is required');
+    }
+
+    try {
+      const result = await activateStructure(
+        this.connection,
+        config.structureName,
+      );
+      return {
+        activateResult: result,
+        errors: [],
+      };
+    } catch (error: unknown) {
+      this.logger?.error('Activate failed:', safeErrorMessage(error));
+      throw error;
+    }
+  }
+
+  /**
+   * Check structure
+   */
+  async check(
+    config: Partial<IStructureConfig>,
+    status?: string,
+  ): Promise<IStructureState> {
+    if (!config.structureName) {
+      throw new Error('Structure name is required');
+    }
+
+    // Map status to version
+    const version: 'active' | 'inactive' =
+      status === 'active' ? 'active' : 'inactive';
+    return {
+      checkResult: await checkStructure(
+        this.connection,
+        config.structureName,
+        version,
+        undefined,
+        this.logger,
+      ),
+      errors: [],
+    };
+  }
+
+  /**
+   * Lock structure for modification
+   */
+  async lock(config: Partial<IStructureConfig>): Promise<string> {
+    if (!config.structureName) {
+      throw new Error('Structure name is required');
+    }
+
+    this.connection.setSessionType('stateful');
+    const lockHandle = await lockStructure(
+      this.connection,
+      config.structureName,
+    );
+    return lockHandle;
+  }
+
+  /**
+   * Unlock structure
+   */
+  async unlock(
+    config: Partial<IStructureConfig>,
+    lockHandle: string,
+  ): Promise<IStructureState> {
+    if (!config.structureName) {
+      throw new Error('Structure name is required');
+    }
+
+    this.connection.setSessionType('stateful');
+    const result = await unlockStructure(
+      this.connection,
+      config.structureName,
+      lockHandle,
+    );
+    this.connection.setSessionType('stateless');
+    return {
+      unlockResult: result,
+      errors: [],
+    };
+  }
+
+  getVersions(config: Partial<IStructureConfig>) {
+    return getStructureVersions(this.connection, config);
+  }
+
+  getVersionSource(contentUri: string) {
+    return getStructureVersionSource(this.connection, contentUri);
+  }
+}
