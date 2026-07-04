@@ -1,0 +1,365 @@
+/**
+ * ADT Object Entities Generator
+ *
+ * Scans core modules and clients to map ADT object entities to classes and methods.
+ *
+ * Usage:
+ *   node tools/adt-object-entities.js
+ *   node tools/adt-object-entities.js --output docs/usage/ADT_OBJECT_ENTITIES.md
+ */
+
+const fs = require('node:fs');
+const path = require('node:path');
+
+const DEFAULT_OUTPUT = path.resolve(
+  __dirname,
+  '../docs/usage/ADT_OBJECT_ENTITIES.md',
+);
+
+const CLIENT_FILES = {
+  adt: path.resolve(__dirname, '../src/clients/AdtClient.ts'),
+};
+
+const SKIP_OBJECTS = new Set(['Utils']);
+const CORE_ROOT = path.resolve(__dirname, '../src/core');
+const CLIENTS_ROOT = path.resolve(__dirname, '../src/clients');
+
+// AdtClient is enumerated separately via its getXxx() factories.
+// The `createAdtClient` helper is a factory function, not a class.
+const SKIP_STANDALONE_CLIENTS = new Set(['AdtClient', 'createAdtClient']);
+
+function readFileSafe(filePath) {
+  return fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf-8') : '';
+}
+
+function uniqueSorted(values) {
+  return Array.from(new Set(values)).sort((a, b) => a.localeCompare(b));
+}
+
+function extractExportedClasses(text) {
+  const classRegex = /export\s+class\s+([A-Za-z0-9_]+)/g;
+  const classes = [];
+  let match = classRegex.exec(text);
+  while (match !== null) {
+    classes.push(match[1]);
+    match = classRegex.exec(text);
+  }
+  return classes;
+}
+
+function extractExportedFunctions(text) {
+  const funcRegex = /export\s+(?:async\s+)?function\s+([A-Za-z0-9_]+)/g;
+  const functions = [];
+  let match = funcRegex.exec(text);
+  while (match !== null) {
+    functions.push(match[1]);
+    match = funcRegex.exec(text);
+  }
+  return functions;
+}
+
+function extractImports(text) {
+  const importRegex =
+    /import\s+\{([^}]+)\}\s+from\s+['"]\.\.\/core\/([^'"]+)['"]/g;
+  const map = {};
+  let match = importRegex.exec(text);
+  while (match !== null) {
+    const names = match[1]
+      .split(',')
+      .map((name) => name.replace(/\btype\b/g, '').trim())
+      .filter(Boolean);
+    const modulePath = match[2].trim();
+    const moduleDir = modulePath.split('/')[0];
+    names.forEach((name) => {
+      map[name] = moduleDir;
+    });
+    match = importRegex.exec(text);
+  }
+  return map;
+}
+
+function extractMethodBases(text, prefix) {
+  const regex = new RegExp(
+    `^\\s*(?:public\\s+|private\\s+|protected\\s+)?(?:async\\s+)?${prefix}([A-Za-z0-9_]+)\\s*\\(`,
+    'gm',
+  );
+  const bases = [];
+  let match = regex.exec(text);
+  while (match !== null) {
+    bases.push(match[1]);
+    match = regex.exec(text);
+  }
+  return uniqueSorted(bases);
+}
+
+function listModuleClasses(modulePath) {
+  if (!fs.existsSync(modulePath)) {
+    return [];
+  }
+
+  const entries = fs
+    .readdirSync(modulePath)
+    .filter((entry) => entry.endsWith('.ts'));
+
+  const classes = entries.flatMap((entry) => {
+    const filePath = path.join(modulePath, entry);
+    const text = readFileSafe(filePath);
+    return extractExportedClasses(text);
+  });
+
+  return uniqueSorted(classes);
+}
+
+function listCoreFunctions(modulePath, fileNames) {
+  const targetFiles =
+    fileNames ??
+    fs
+      .readdirSync(modulePath)
+      .filter(
+        (entry) =>
+          entry.endsWith('.ts') && entry !== 'index.ts' && entry !== 'types.ts',
+      );
+
+  const functions = targetFiles.flatMap((fileName) => {
+    const filePath = path.join(modulePath, fileName);
+    if (!fs.existsSync(filePath)) {
+      return [];
+    }
+    const text = readFileSafe(filePath);
+    const exported = extractExportedFunctions(text);
+    return exported.map((fn) => `${fileName}:${fn}`);
+  });
+
+  return uniqueSorted(functions);
+}
+
+function methodExists(text, methodName) {
+  const methodRegex = new RegExp(`\\b${methodName}\\s*\\(`);
+  return methodRegex.test(text);
+}
+
+function listCoreModules() {
+  if (!fs.existsSync(CORE_ROOT)) {
+    return [];
+  }
+
+  return fs
+    .readdirSync(CORE_ROOT)
+    .filter((entry) => fs.statSync(path.join(CORE_ROOT, entry)).isDirectory())
+    .filter((entry) => entry !== 'shared');
+}
+
+function resolveModuleDir(className, importMap, methodBase, moduleDirs) {
+  if (importMap[className]) {
+    return importMap[className];
+  }
+
+  const baseLower = methodBase.toLowerCase();
+  const match = moduleDirs.find((dir) => dir.toLowerCase() === baseLower);
+  return match ?? 'unknown';
+}
+
+function collectObjects(clientText) {
+  const importMap = extractImports(clientText.adt);
+  const moduleDirs = listCoreModules();
+  const methodBases = new Set();
+
+  extractMethodBases(clientText.adt, 'get').forEach((base) => {
+    if (!SKIP_OBJECTS.has(base)) {
+      methodBases.add(base);
+    }
+  });
+
+  const objects = Array.from(methodBases).map((methodBase) => {
+    const className = `Adt${methodBase}`;
+    const moduleDir = resolveModuleDir(
+      className,
+      importMap,
+      methodBase,
+      moduleDirs,
+    );
+    const id = methodBase.replace(/^[A-Z]/, (letter) => letter.toLowerCase());
+
+    return {
+      id,
+      label: methodBase,
+      moduleDir,
+      methodBase,
+    };
+  });
+
+  return objects.sort((a, b) => a.label.localeCompare(b.label));
+}
+
+function parseArgs(argv) {
+  const args = argv.slice(2);
+  let output = DEFAULT_OUTPUT;
+
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--output' && args[i + 1]) {
+      output = path.resolve(args[i + 1]);
+      i += 1;
+      continue;
+    }
+    if (arg === '--help' || arg === '-h') {
+      console.log(
+        [
+          'ADT Object Entities Generator',
+          '',
+          'Usage:',
+          '  node tools/adt-object-entities.js',
+          '  node tools/adt-object-entities.js --output docs/usage/ADT_OBJECT_ENTITIES.md',
+        ].join('\n'),
+      );
+      process.exit(0);
+    }
+  }
+
+  return { output };
+}
+
+/**
+ * Public method names on a class, excluding constructor, private/protected,
+ * and inherited-from-Object boilerplate. Purely regex-driven — no TS parsing.
+ *
+ * Only matches actual method DECLARATIONS (name(...) : Type { OR name(...) {),
+ * not method calls inside the body. Skips any method whose line starts with
+ * the `private` or `protected` modifier.
+ */
+function extractPublicMethodNames(classBody) {
+  // Name must be followed by (params) optional return-type and `{` body.
+  // This rejects calls like `super(arg)` or `helper()` that aren't followed
+  // by an opening brace.
+  const methodRegex =
+    /^\s*(?!private\b|protected\b)(?:public\s+)?(?:static\s+)?(?:async\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^>]*>)?\s*\([^)]*\)(?:\s*:\s*[^{;]+)?\s*\{/gm;
+  const names = new Set();
+  let match = methodRegex.exec(classBody);
+  while (match !== null) {
+    const name = match[1];
+    if (
+      name !== 'constructor' &&
+      name !== 'super' &&
+      !/^(if|for|while|switch|return|throw|await|new|typeof)$/.test(name)
+    ) {
+      names.add(name);
+    }
+    match = methodRegex.exec(classBody);
+  }
+  return uniqueSorted(Array.from(names));
+}
+
+function extractClassBody(text, className) {
+  const classStart = text.search(
+    new RegExp(`export\\s+class\\s+${className}\\b`),
+  );
+  if (classStart < 0) return '';
+  const openBrace = text.indexOf('{', classStart);
+  if (openBrace < 0) return '';
+  let depth = 1;
+  let i = openBrace + 1;
+  while (i < text.length && depth > 0) {
+    const ch = text[i];
+    if (ch === '{') depth += 1;
+    else if (ch === '}') depth -= 1;
+    i += 1;
+  }
+  return text.slice(openBrace + 1, i - 1);
+}
+
+function listStandaloneClients() {
+  if (!fs.existsSync(CLIENTS_ROOT)) return [];
+  const rootEntries = fs
+    .readdirSync(CLIENTS_ROOT)
+    .filter((entry) => entry.endsWith('.ts'));
+
+  const clients = [];
+  for (const entry of rootEntries) {
+    const filePath = path.join(CLIENTS_ROOT, entry);
+    const text = readFileSafe(filePath);
+    const exportedClasses = extractExportedClasses(text);
+    for (const className of exportedClasses) {
+      if (SKIP_STANDALONE_CLIENTS.has(className)) continue;
+      const body = extractClassBody(text, className);
+      const methods = extractPublicMethodNames(body);
+      clients.push({
+        className,
+        file: path.relative(path.resolve(__dirname, '..'), filePath),
+        methods,
+      });
+    }
+  }
+
+  return clients.sort((a, b) => a.className.localeCompare(b.className));
+}
+
+function generateMarkdown(objects, clientText) {
+  const lines = [];
+  lines.push('# ADT Object Entities');
+  lines.push('');
+  lines.push(
+    '_Generated by `tools/adt-object-entities.js`. Do not edit by hand._',
+  );
+  lines.push('');
+
+  objects.forEach((object) => {
+    const modulePath = path.resolve(__dirname, '../src/core', object.moduleDir);
+    const classes =
+      object.moduleDir === 'unknown' ? [] : listModuleClasses(modulePath);
+    const functions =
+      object.moduleDir === 'unknown' ? [] : listCoreFunctions(modulePath);
+    const clientMethods = [];
+    const adtMethod = `get${object.methodBase}`;
+    if (methodExists(clientText.adt, adtMethod)) {
+      clientMethods.push(`AdtClient.${adtMethod}`);
+    }
+
+    lines.push(`## ${object.label}`);
+    lines.push(`- Core module: \`${object.moduleDir}\``);
+    lines.push(
+      `- Core classes: ${classes.length ? classes.map((name) => `\`${name}\``).join(', ') : '—'}`,
+    );
+    lines.push(
+      `- Client methods: ${clientMethods.length ? clientMethods.map((name) => `\`${name}\``).join(', ') : '—'}`,
+    );
+    lines.push(
+      `- Core functions: ${functions.length ? functions.map((name) => `\`${name}\``).join(', ') : '—'}`,
+    );
+    lines.push('');
+  });
+
+  // Standalone top-level clients (not AdtClient factories).
+  const standalone = listStandaloneClients();
+  if (standalone.length > 0) {
+    lines.push('## Standalone Clients');
+    lines.push('');
+    lines.push(
+      'Top-level client classes instantiated directly (not via `AdtClient.getXxx()`). They live under `src/clients/` alongside `AdtClient` and wrap non-`IAdtObject` surfaces.',
+    );
+    lines.push('');
+    for (const client of standalone) {
+      lines.push(`### ${client.className}`);
+      lines.push(`- Source: \`${client.file}\``);
+      lines.push(
+        `- Public methods: ${client.methods.length ? client.methods.map((name) => `\`${name}\``).join(', ') : '—'}`,
+      );
+      lines.push('');
+    }
+  }
+
+  return lines.join('\n');
+}
+
+function main() {
+  const { output } = parseArgs(process.argv);
+  const clientText = {
+    adt: readFileSafe(CLIENT_FILES.adt),
+  };
+
+  const objects = collectObjects(clientText);
+  const markdown = generateMarkdown(objects, clientText);
+  fs.mkdirSync(path.dirname(output), { recursive: true });
+  fs.writeFileSync(output, `${markdown}\n`, 'utf-8');
+}
+
+main();
