@@ -1,0 +1,303 @@
+/**
+ * Integration test for FunctionGroup
+ * Tests using AdtClient for unified CRUD operations
+ *
+ * Enable debug logs:
+ *  DEBUG_ADT_TESTS=true   - Integration test execution logs
+ *  DEBUG_ADT_LIBS=true    - FunctionGroup library logs
+ *  DEBUG_CONNECTORS=true   - Connection logs (@mcp-abap-adt/connection)
+ *
+ * Run: npm test -- --testPathPatterns=functionGroup/FunctionGroup
+ */
+
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { createAbapConnection } from '@mcp-abap-adt/connection';
+import type { IAbapConnection, ILogger } from '@mcp-abap-adt/interfaces';
+import * as dotenv from 'dotenv';
+import type { AdtClient } from '../../../../clients/AdtClient';
+import type {
+  IFunctionGroupConfig,
+  IFunctionGroupState,
+} from '../../../../core/functionGroup';
+import { isCloudEnvironment } from '../../../../utils/systemInfo';
+import { BaseTester } from '../../../helpers/BaseTester';
+import {
+  createTestAdtClient,
+  getConfig,
+  resolveSystemContext,
+} from '../../../helpers/sessionConfig';
+import { TestConfigResolver } from '../../../helpers/TestConfigResolver';
+import {
+  createConnectionLogger,
+  createLibraryLogger,
+  createTestsLogger,
+} from '../../../helpers/testLogger';
+import {
+  logTestEnd,
+  logTestError,
+  logTestSkip,
+  logTestStart,
+  logTestSuccess,
+} from '../../../helpers/testProgressLogger';
+
+const {
+  resolvePackageName,
+  resolveTransportRequest,
+  resolveMasterSystem,
+  getTimeout,
+} = require('../../../helpers/test-helper');
+
+const envPath =
+  process.env.MCP_ENV_PATH || path.resolve(__dirname, '../../../../.env');
+if (fs.existsSync(envPath)) {
+  dotenv.config({ path: envPath, quiet: true });
+}
+
+// Connection logs use DEBUG_CONNECTORS (from @mcp-abap-adt/connection)
+const connectionLogger: ILogger = createConnectionLogger();
+
+// Library code uses DEBUG_ADT_LIBS
+const libraryLogger: ILogger = createLibraryLogger();
+
+// Test execution logs use DEBUG_ADT_TESTS
+const testsLogger: ILogger = createTestsLogger();
+
+describe('FunctionGroup (using AdtClient)', () => {
+  let connection: IAbapConnection;
+  let client: AdtClient;
+  let hasConfig = false;
+  let isCloudSystem = false;
+  let isLegacy = false;
+  let tester: BaseTester<IFunctionGroupConfig, IFunctionGroupState>;
+
+  beforeAll(async () => {
+    try {
+      const config = getConfig();
+      connection = createAbapConnection(config, connectionLogger);
+      await (connection as any).connect();
+      isCloudSystem = await isCloudEnvironment(connection);
+      const systemContext = await resolveSystemContext(
+        connection,
+        isCloudSystem,
+      );
+      const { client: resolvedClient, isLegacy: legacy } =
+        await createTestAdtClient(connection, libraryLogger, systemContext);
+      client = resolvedClient;
+      isLegacy = legacy;
+      hasConfig = true;
+
+      tester = new BaseTester(
+        client.getFunctionGroup(),
+        'FunctionGroup',
+        'create_function_group',
+        'adt_function_group',
+        testsLogger,
+      );
+
+      tester.setup({
+        connection,
+        client,
+        hasConfig,
+        isCloudSystem,
+        buildConfig: (testCase: any, resolver?: any) => {
+          const params = testCase?.params || {};
+          // Use resolver to get resolved parameters (from test case params or global defaults)
+          const packageName =
+            resolver?.getPackageName?.() ||
+            resolvePackageName(params.package_name);
+          if (!packageName) throw new Error('package_name not configured');
+          const transportRequest =
+            resolver?.getTransportRequest?.() ||
+            resolveTransportRequest(params.transport_request);
+          return {
+            functionGroupName: params.function_group_name,
+            packageName,
+            transportRequest,
+            description: params.description,
+            masterSystem: resolveMasterSystem(params.master_system),
+            responsible: process.env.SAP_USERNAME || process.env.SAP_USER,
+          };
+        },
+        ensureObjectReady: async (functionGroupName: string) => {
+          if (!connection) return { success: true };
+          try {
+            const { client: cleanupClient } = await createTestAdtClient(
+              connection,
+              libraryLogger,
+              systemContext,
+            );
+            const existing = await cleanupClient
+              .getFunctionGroup()
+              .read({ functionGroupName });
+            if (existing) {
+              // Try to release any stale lock before deleting
+              try {
+                const lockHandle = await cleanupClient
+                  .getFunctionGroup()
+                  .lock({ functionGroupName });
+                if (lockHandle) {
+                  await cleanupClient
+                    .getFunctionGroup()
+                    .unlock({ functionGroupName }, lockHandle);
+                  testsLogger.info?.(
+                    `Released stale lock on ${functionGroupName}`,
+                  );
+                }
+              } catch (lockError: any) {
+                // Lock failed — object locked by another user/session
+                const msg = lockError.message || String(lockError);
+                if (
+                  lockError.response?.status === 403 ||
+                  msg.includes('currently editing')
+                ) {
+                  testsLogger.warn(
+                    `Cannot release lock on ${functionGroupName}: ${msg}. ` +
+                      `Clear the lock in SM12 or close SE80.`,
+                  );
+                  return {
+                    success: false,
+                    reason: `${functionGroupName} is locked: ${msg}. Clear lock in SM12.`,
+                  };
+                }
+                // Other lock errors (404 etc.) — ignore and try delete anyway
+              }
+
+              try {
+                const transportRequest = tester.getTransportRequest();
+                await cleanupClient.getFunctionGroup().delete({
+                  functionGroupName,
+                  transportRequest,
+                });
+                await new Promise((resolve) => setTimeout(resolve, 3000));
+              } catch (cleanupError: any) {
+                testsLogger.warn(
+                  `Could not delete existing function group ${functionGroupName}: ${cleanupError.message}. Will attempt update instead of create.`,
+                );
+                return { success: true, objectExists: true };
+              }
+            }
+          } catch (error: any) {
+            if (error.response?.status !== 404) {
+              return {
+                success: false,
+                reason: `Cannot verify function group existence: ${error.message}`,
+              };
+            }
+          }
+          return { success: true };
+        },
+      });
+    } catch (_error) {
+      hasConfig = false;
+    }
+  });
+
+  afterAll(() => tester?.afterAll()());
+
+  describe('Full workflow', () => {
+    beforeEach(() => tester?.beforeEach()());
+    afterEach(() => tester?.afterEach()());
+
+    it(
+      'should execute full workflow and store all results',
+      async () => {
+        if (!tester) {
+          return;
+        }
+        if (!hasConfig) {
+          await tester.flowTestAuto();
+          return;
+        }
+        const config = tester.getConfig();
+        if (!config) {
+          await tester.flowTestAuto();
+          return;
+        }
+
+        await tester.flowTestAuto({
+          updateConfig: {
+            functionGroupName: config.functionGroupName,
+            packageName: config.packageName,
+            description: config.description || '',
+            transportRequest: config.transportRequest,
+          },
+        });
+      },
+      getTimeout('test'),
+    );
+  });
+
+  describe('Read standard object', () => {
+    it(
+      'should read standard SAP function group',
+      async () => {
+        // Use TestConfigResolver for consistent parameter resolution
+        const resolver = new TestConfigResolver({
+          isCloud: isCloudSystem,
+          logger: testsLogger,
+        });
+        const standardObject = resolver.getStandardObject('function_group');
+
+        if (!standardObject) {
+          logTestStart(testsLogger, 'FunctionGroup - read standard object', {
+            name: 'read_standard',
+            params: {},
+          });
+          logTestSkip(
+            libraryLogger,
+            'FunctionGroup - read standard object',
+            `Standard function group not configured for ${isCloudSystem ? 'cloud' : isLegacy ? 'legacy' : 'on-premise'} environment`,
+          );
+          return;
+        }
+
+        const standardFunctionGroupName = standardObject.name;
+        logTestStart(testsLogger, 'FunctionGroup - read standard object', {
+          name: 'read_standard',
+          params: { function_group_name: standardFunctionGroupName },
+        });
+
+        if (!hasConfig) {
+          logTestSkip(
+            testsLogger,
+            'FunctionGroup - read standard object',
+            'No SAP configuration',
+          );
+          return;
+        }
+
+        try {
+          const resultState = await tester.readTest({
+            functionGroupName: standardFunctionGroupName,
+          });
+          expect(resultState).toBeDefined();
+          expect(resultState?.readResult).toBeDefined();
+          // FunctionGroup read returns function group config - check if functionGroupName is present
+          const functionGroupConfig = resultState?.readResult;
+          if (
+            functionGroupConfig &&
+            typeof functionGroupConfig === 'object' &&
+            'functionGroupName' in functionGroupConfig
+          ) {
+            expect((functionGroupConfig as any).functionGroupName).toBe(
+              standardFunctionGroupName,
+            );
+          }
+
+          logTestSuccess(testsLogger, 'FunctionGroup - read standard object');
+        } catch (error) {
+          logTestError(
+            testsLogger,
+            'FunctionGroup - read standard object',
+            error,
+          );
+          throw error;
+        } finally {
+          logTestEnd(testsLogger, 'FunctionGroup - read standard object');
+        }
+      },
+      getTimeout('test'),
+    );
+  });
+});
