@@ -1,0 +1,120 @@
+/**
+ * Interface create operations - Low-level functions (1 function = 1 HTTP request)
+ *
+ * NOTE: Caller should call connection.setSessionType("stateful") before creating
+ */
+
+import type {
+  IAdtResponse as AxiosResponse,
+  HttpError,
+  IAbapConnection,
+  ILogger,
+} from '@mcp-abap-adt/interfaces';
+import { CT_INTERFACE } from '../../constants/contentTypes';
+import { limitDescription, safeStringify } from '../../utils/internalUtils';
+import { getTimeout } from '../../utils/timeouts';
+import type { ICreateInterfaceParams } from './types';
+
+/**
+ * Generate minimal interface source code if not provided
+ */
+export function generateInterfaceTemplate(
+  interfaceName: string,
+  description: string,
+): string {
+  return `INTERFACE ${interfaceName}
+  PUBLIC.
+
+  " ${description}
+
+  METHODS: get_value
+    RETURNING VALUE(rv_result) TYPE string.
+
+ENDINTERFACE.`;
+}
+
+/**
+ * Low-level: Create interface object with metadata (POST)
+ * Does NOT lock/upload/activate - just creates the object
+ */
+export async function create(
+  connection: IAbapConnection,
+  params: ICreateInterfaceParams,
+  logger?: ILogger,
+): Promise<AxiosResponse> {
+  const finalMasterSystem = params.masterSystem || '';
+  const finalResponsible = params.responsible || '';
+
+  // Description is limited to 60 characters in SAP ADT
+  const limitedDescription = limitDescription(params.description);
+  const masterSystemAttr = finalMasterSystem
+    ? ` adtcore:masterSystem="${finalMasterSystem}"`
+    : '';
+  const responsibleAttr = finalResponsible
+    ? ` adtcore:responsible="${finalResponsible}"`
+    : '';
+
+  const payload = `<?xml version="1.0" encoding="UTF-8"?><intf:abapInterface xmlns:intf="http://www.sap.com/adt/oo/interfaces" xmlns:adtcore="http://www.sap.com/adt/core" adtcore:description="${limitedDescription}" adtcore:language="${params.masterLanguage || 'EN'}" adtcore:name="${params.interfaceName}" adtcore:type="INTF/OI" adtcore:masterLanguage="${params.masterLanguage || 'EN'}"${masterSystemAttr}${responsibleAttr}>
+
+
+
+  <adtcore:packageRef adtcore:name="${params.packageName}"/>
+
+
+
+</intf:abapInterface>`;
+
+  const url = `/sap/bc/adt/oo/interfaces${params.transportRequest ? `?corrNr=${params.transportRequest}` : ''}`;
+
+  const headers = {
+    'Content-Type': CT_INTERFACE,
+    Accept: CT_INTERFACE,
+  };
+
+  try {
+    const response = await connection.makeAdtRequest({
+      url,
+      method: 'POST',
+      timeout: getTimeout('default'),
+      data: payload,
+      headers,
+    });
+
+    // Verify response status - should be 201 Created
+    if (response.status !== 201 && response.status !== 200) {
+      const errorData =
+        typeof response.data === 'string'
+          ? response.data.substring(0, 1000)
+          : JSON.stringify(response.data).substring(0, 1000);
+      logger?.error?.(
+        `[ERROR] Create interface returned unexpected status - Status: ${response.status}`,
+      );
+      logger?.error?.(`[ERROR] Create interface - Response data:`, errorData);
+      throw new Error(
+        `Interface creation returned status ${response.status} instead of 201`,
+      );
+    }
+
+    return response;
+  } catch (error: unknown) {
+    const e = error as HttpError;
+    // Log error details for debugging (similar to class create)
+    if (e.response) {
+      const errorData =
+        typeof e.response.data === 'string'
+          ? e.response.data.substring(0, 1000)
+          : safeStringify(e.response.data).substring(0, 1000);
+      logger?.error?.(
+        `[ERROR] Create interface failed - Status: ${e.response.status}`,
+      );
+      logger?.error?.(
+        `[ERROR] Create interface failed - StatusText: ${e.response.statusText}`,
+      );
+      logger?.error?.(
+        `[ERROR] Create interface failed - Response data:`,
+        errorData,
+      );
+    }
+    throw error;
+  }
+}
