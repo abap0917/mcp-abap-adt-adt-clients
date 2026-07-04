@@ -1,0 +1,41 @@
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+.env
+.env.*
+.DS_Store
+*.log
+tests/test-config.yaml
+
+# Compiled JS files in src (should be in dist)
+src/**/*.js
+src/**/*.js.map
+# Exception: test-helper.js is an intentional JS file (not compiled from TS)
+!src/__tests__/helpers/test-helper.js
+
+coverage/**
+
+# Session and lock files - keep directories but ignore contents
+.sessions/*
+!.sessions/.keep
+
+.locks/*
+!.locks/.keep
+mcp-abap-adt-adt-clients-*.tgz
+sk.json
+src/__tests__/helpers/test-config.yaml
+*.env
+
+# Claude Code local settings
+.claude/
+
+# Codex CLI
+.codex/
+
+# Temp/scratch files
+cookies.txt
+*.abap
+
+# Credential/config files (not for repo)
+mdd-*.json
