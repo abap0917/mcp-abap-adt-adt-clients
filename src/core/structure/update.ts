@@ -1,0 +1,49 @@
+/**
+ * Structure update operations
+ */
+
+import type {
+  IAdtResponse as AxiosResponse,
+  IAbapConnection,
+} from '@mcp-abap-adt/interfaces';
+import { CT_SOURCE } from '../../constants/contentTypes';
+import { encodeSapObjectName } from '../../utils/internalUtils';
+import { getTimeout } from '../../utils/timeouts';
+import type { IUpdateStructureParams } from './types';
+
+/**
+ * Upload structure DDL code (low-level - uses existing lockHandle)
+ * This function does NOT lock/unlock - it assumes the object is already locked
+ * Used internally by AdtStructure
+ */
+export async function upload(
+  connection: IAbapConnection,
+  params: IUpdateStructureParams,
+  lockHandle: string,
+): Promise<AxiosResponse> {
+  const structureNameEncoded = encodeSapObjectName(params.structureName);
+  const url = `/sap/bc/adt/ddic/structures/${structureNameEncoded}/source?lockHandle=${encodeURIComponent(lockHandle)}${params.transportRequest ? `&corrNr=${params.transportRequest}` : ''}`;
+
+  const headers = {
+    Accept: 'application/xml, application/json, text/plain, */*',
+    'Content-Type': CT_SOURCE,
+  };
+
+  return connection.makeAdtRequest({
+    url,
+    method: 'PUT',
+    timeout: getTimeout('default'),
+    data: params.ddlCode,
+    headers,
+  });
+}
+
+/**
+ * Update structure with DDL code (alias for upload with lockHandle in params)
+ */
+export async function updateStructure(
+  connection: IAbapConnection,
+  params: IUpdateStructureParams & { lockHandle: string },
+): Promise<AxiosResponse> {
+  return upload(connection, params, params.lockHandle);
+}
