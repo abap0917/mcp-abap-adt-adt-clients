@@ -1,0 +1,671 @@
+/**
+ * AdtBehaviorDefinition - High-level CRUD operations for Behavior Definition objects
+ *
+ * Implements IAdtObject interface with automatic operation chains,
+ * error handling, and resource cleanup.
+ *
+ * Uses low-level functions directly (not Builder classes).
+ *
+ * Session management:
+ * - stateful: only when doing lock/update/unlock operations
+ * - stateless: obligatory after unlock
+ * - If no lock/unlock, no stateful needed
+ * - activate uses same session/cookies (no stateful needed)
+ *
+ * Operation chains:
+ * - Create: validate → create → check → lock → check(inactive) → update → unlock → check → activate
+ * - Update: lock → check(inactive) → update → unlock → check → activate
+ * - Delete: check(deletion) → delete
+ */
+
+import type {
+  HttpError,
+  IAbapConnection,
+  IAdtObject,
+  IAdtOperationOptions,
+  ILogger,
+} from '@mcp-abap-adt/interfaces';
+import type { IAdtSystemContext } from '../../clients/AdtClient';
+import { safeErrorMessage } from '../../utils/internalUtils';
+import type { IReadOptions } from '../shared/types';
+import { activate } from './activation';
+import { check as checkBehaviorDefinition } from './check';
+import { create as createBehaviorDefinition } from './create';
+import { checkDeletion, deleteBehaviorDefinition } from './delete';
+import { lock } from './lock';
+import {
+  getBehaviorDefinitionTransport,
+  read as readBehaviorDefinition,
+  readSource,
+} from './read';
+import type {
+  IBehaviorDefinitionConfig,
+  IBehaviorDefinitionState,
+} from './types';
+import { unlock } from './unlock';
+import { update } from './update';
+import { validate } from './validation';
+
+import {
+  getBehaviorDefinitionVersionSource,
+  getBehaviorDefinitionVersions,
+} from './versions';
+export class AdtBehaviorDefinition
+  implements IAdtObject<IBehaviorDefinitionConfig, IBehaviorDefinitionState>
+{
+  private readonly connection: IAbapConnection;
+  private readonly logger?: ILogger;
+  private readonly systemContext: IAdtSystemContext;
+  public readonly objectType: string = 'BehaviorDefinition';
+
+  constructor(
+    connection: IAbapConnection,
+    logger?: ILogger,
+    systemContext?: IAdtSystemContext,
+  ) {
+    this.connection = connection;
+    this.logger = logger;
+    this.systemContext = systemContext ?? {};
+  }
+
+  /**
+   * Validate behavior definition configuration before creation
+   */
+  async validate(
+    config: Partial<IBehaviorDefinitionConfig>,
+  ): Promise<IBehaviorDefinitionState> {
+    const state: IBehaviorDefinitionState = { errors: [] };
+    if (!config.name) {
+      const error = new Error(
+        'Behavior definition name is required for validation',
+      );
+      state.errors.push({ method: 'validate', error, timestamp: new Date() });
+      throw error;
+    }
+    if (!config.rootEntity) {
+      const error = new Error('Root entity is required for validation');
+      state.errors.push({ method: 'validate', error, timestamp: new Date() });
+      throw error;
+    }
+    if (!config.packageName) {
+      const error = new Error('Package name is required for validation');
+      state.errors.push({ method: 'validate', error, timestamp: new Date() });
+      throw error;
+    }
+    if (!config.implementationType) {
+      const error = new Error('Implementation type is required for validation');
+      state.errors.push({ method: 'validate', error, timestamp: new Date() });
+      throw error;
+    }
+
+    try {
+      const response = await validate(this.connection, {
+        objname: config.name,
+        rootEntity: config.rootEntity,
+        description: config.description || config.name,
+        package: config.packageName,
+        implementationType: config.implementationType,
+      });
+      state.validationResponse = response;
+      return state;
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      state.errors.push({
+        method: 'validate',
+        error: err,
+        timestamp: new Date(),
+      });
+      this.logger?.error('Validate failed:', safeErrorMessage(err));
+      throw err;
+    }
+  }
+
+  /**
+   * Create behavior definition with full operation chain
+   */
+  async create(
+    config: IBehaviorDefinitionConfig,
+    options?: IAdtOperationOptions,
+  ): Promise<IBehaviorDefinitionState> {
+    const state: IBehaviorDefinitionState = { errors: [] };
+    if (!config.name) {
+      throw new Error('Behavior definition name is required');
+    }
+    if (!config.packageName) {
+      throw new Error('Package name is required');
+    }
+    if (!config.description) {
+      throw new Error('Description is required');
+    }
+    if (!config.rootEntity) {
+      throw new Error('Root entity is required');
+    }
+    if (!config.implementationType) {
+      throw new Error('Implementation type is required');
+    }
+
+    let objectCreated = false;
+
+    try {
+      // Create behavior definition
+      this.logger?.info?.('Creating behavior definition');
+      const createResponse = await createBehaviorDefinition(this.connection, {
+        name: config.name,
+        package: config.packageName,
+        description: config.description,
+        implementationType: config.implementationType,
+        transportRequest: config.transportRequest,
+        language: config.masterLanguage ?? this.systemContext.masterLanguage,
+        masterSystem: this.systemContext.masterSystem,
+        responsible: this.systemContext.responsible,
+      });
+      state.createResult = createResponse;
+      objectCreated = true;
+      this.logger?.info?.('Behavior definition created');
+
+      return state;
+    } catch (error: unknown) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      state.errors.push({
+        method: 'create',
+        error: err,
+        timestamp: new Date(),
+      });
+
+      // Cleanup on error - ensure stateless
+      this.connection.setSessionType('stateless');
+
+      if (objectCreated && options?.deleteOnFailure) {
+        try {
+          this.logger?.warn?.('Deleting behavior definition after failure');
+          // No stateful needed - delete doesn't use lock/unlock
+          await deleteBehaviorDefinition(
+            this.connection,
+            config.name,
+            config.transportRequest,
+          );
+        } catch (deleteError) {
+          this.logger?.warn?.(
+            'Failed to delete behavior definition after failure:',
+            safeErrorMessage(deleteError),
+          );
+        }
+      }
+
+      this.logger?.error('Create failed:', safeErrorMessage(err));
+      throw err;
+    }
+  }
+
+  /**
+   * Read behavior definition
+   */
+  async read(
+    config: Partial<IBehaviorDefinitionConfig>,
+    version?: 'active' | 'inactive',
+    options?: IReadOptions,
+  ): Promise<IBehaviorDefinitionState | undefined> {
+    const state: IBehaviorDefinitionState = { errors: [] };
+    if (!config.name) {
+      const error = new Error('Behavior definition name is required');
+      state.errors.push({ method: 'read', error, timestamp: new Date() });
+      throw error;
+    }
+
+    try {
+      const response = await readSource(
+        this.connection,
+        config.name,
+        version,
+        options,
+        this.logger,
+      );
+      state.readResult = response;
+      return state;
+    } catch (error: unknown) {
+      const e = error as HttpError;
+      if (e.response?.status === 404) {
+        return undefined;
+      }
+      const err = error instanceof Error ? error : new Error(String(error));
+      state.errors.push({ method: 'read', error: err, timestamp: new Date() });
+      this.logger?.error('Read failed:', safeErrorMessage(err));
+      throw err;
+    }
+  }
+
+  /**
+   * Read behavior definition metadata (object characteristics: package, responsible, description, etc.)
+   */
+  async readMetadata(
+    config: Partial<IBehaviorDefinitionConfig>,
+    options?: IReadOptions,
+  ): Promise<IBehaviorDefinitionState> {
+    const state: IBehaviorDefinitionState = { errors: [] };
+    if (!config.name) {
+      const error = new Error('Behavior definition name is required');
+      state.errors.push({
+        method: 'readMetadata',
+        error,
+        timestamp: new Date(),
+      });
+      throw error;
+    }
+    try {
+      // Use empty sessionId for metadata read
+      const response = await readBehaviorDefinition(
+        this.connection,
+        config.name,
+        '',
+        'inactive',
+        options,
+        this.logger,
+      );
+      state.metadataResult = response;
+      this.logger?.info?.('Behavior definition metadata read successfully');
+      return state;
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      state.errors.push({
+        method: 'readMetadata',
+        error: err,
+        timestamp: new Date(),
+      });
+      this.logger?.error('Read metadata failed:', safeErrorMessage(err));
+      throw err;
+    }
+  }
+
+  /**
+   * Read transport request information for the behavior definition
+   */
+  async readTransport(
+    config: Partial<IBehaviorDefinitionConfig>,
+    options?: { withLongPolling?: boolean },
+  ): Promise<IBehaviorDefinitionState> {
+    const state: IBehaviorDefinitionState = { errors: [] };
+    if (!config.name) {
+      const error = new Error('Behavior definition name is required');
+      state.errors.push({
+        method: 'readTransport',
+        error,
+        timestamp: new Date(),
+      });
+      throw error;
+    }
+    try {
+      const response = await getBehaviorDefinitionTransport(
+        this.connection,
+        config.name,
+        options?.withLongPolling !== undefined
+          ? { withLongPolling: options.withLongPolling }
+          : undefined,
+      );
+      state.transportResult = response;
+      this.logger?.info?.(
+        'Behavior definition transport request read successfully',
+      );
+      return state;
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      state.errors.push({
+        method: 'readTransport',
+        error: err,
+        timestamp: new Date(),
+      });
+      this.logger?.error('Read transport failed:', safeErrorMessage(err));
+      throw err;
+    }
+  }
+
+  /**
+   * Update behavior definition with full operation chain
+   * Always starts with lock
+   * If options.lockHandle is provided, performs only low-level update without lock/check/unlock chain
+   */
+  async update(
+    config: Partial<IBehaviorDefinitionConfig>,
+    options?: IAdtOperationOptions,
+  ): Promise<IBehaviorDefinitionState> {
+    const state: IBehaviorDefinitionState = { errors: [] };
+    if (!config.name) {
+      const error = new Error('Behavior definition name is required');
+      state.errors.push({ method: 'update', error, timestamp: new Date() });
+      throw error;
+    }
+
+    // Low-level mode: if lockHandle is provided, perform only update operation
+    if (options?.lockHandle) {
+      const codeToUpdate = options?.sourceCode || config.sourceCode;
+      if (!codeToUpdate) {
+        throw new Error('Source code is required for update');
+      }
+
+      this.logger?.info?.(
+        'Low-level update: performing update only (lockHandle provided)',
+      );
+      const updateResponse = await update(this.connection, {
+        name: config.name,
+        sourceCode: codeToUpdate,
+        lockHandle: options.lockHandle,
+        transportRequest: config.transportRequest,
+      });
+      this.logger?.info?.('Behavior definition updated (low-level)');
+      return {
+        updateResult: updateResponse,
+        errors: [],
+      };
+    }
+
+    let lockHandle: string | undefined;
+
+    try {
+      // 1. Lock (update always starts with lock, stateful ONLY before lock)
+      this.logger?.info?.('Step 1: Locking behavior definition');
+      this.connection.setSessionType('stateful');
+      lockHandle = await lock(this.connection, config.name);
+      state.lockHandle = lockHandle;
+      this.logger?.info?.('Behavior definition locked, handle:', lockHandle);
+
+      // 2. Check inactive with code for update (from options or config)
+      const codeToCheck = options?.sourceCode || config.sourceCode;
+      if (codeToCheck) {
+        this.logger?.info?.(
+          'Step 2: Checking inactive version with update content',
+        );
+        const checkInactiveResponse = await checkBehaviorDefinition(
+          this.connection,
+          config.name,
+          'abapCheckRun',
+          '',
+          'inactive',
+          codeToCheck,
+        );
+        state.checkResult = checkInactiveResponse;
+        this.logger?.info?.('Check inactive with update content passed');
+      }
+
+      // 3. Update
+      if (codeToCheck && lockHandle) {
+        this.logger?.info?.('Step 3: Updating behavior definition');
+        const updateResponse = await update(this.connection, {
+          name: config.name,
+          sourceCode: codeToCheck,
+          lockHandle,
+          transportRequest: config.transportRequest,
+        });
+        state.updateResult = updateResponse;
+        this.logger?.info?.('Behavior definition updated');
+
+        // 3.5. Read with long polling (wait for object to be ready after update)
+        this.logger?.info?.('read (wait for object ready after update)');
+        try {
+          await this.read({ name: config.name }, 'active', {
+            withLongPolling: true,
+          });
+          this.logger?.info?.('object is ready after update');
+        } catch (readError) {
+          this.logger?.warn?.(
+            'read with long polling failed (object may not be ready yet):',
+            safeErrorMessage(readError),
+          );
+          // Continue anyway - unlock might still work
+        }
+      }
+
+      // 4. Unlock (obligatory stateless after unlock)
+      if (lockHandle) {
+        this.logger?.info?.('Step 4: Unlocking behavior definition');
+        this.connection.setSessionType('stateful');
+        const unlockResponse = await unlock(
+          this.connection,
+          config.name,
+          lockHandle,
+        );
+        state.unlockResult = unlockResponse;
+        this.connection.setSessionType('stateless');
+        lockHandle = undefined;
+        this.logger?.info?.('Behavior definition unlocked');
+      }
+
+      // 5. Final check (no stateful needed)
+      this.logger?.info?.('Step 5: Final check');
+      const finalCheckResponse = await checkBehaviorDefinition(
+        this.connection,
+        config.name,
+        'bdefImplementationCheck',
+        '',
+        'inactive',
+      );
+      state.checkResult = finalCheckResponse;
+      this.logger?.info?.('Final check passed');
+
+      // 6. Activate (if requested, no stateful needed - uses same session/cookies)
+      if (options?.activateOnUpdate) {
+        this.logger?.info?.('Step 6: Activating behavior definition');
+        const activateResponse = await activate(this.connection, config.name);
+        state.activateResult = activateResponse;
+        this.logger?.info?.(
+          'Behavior definition activated, status:',
+          activateResponse.status,
+        );
+
+        // 6.5. Read with long polling (wait for object to be ready after activation)
+        this.logger?.info?.('read (wait for object ready after activation)');
+        try {
+          await this.read({ name: config.name }, 'active', {
+            withLongPolling: true,
+          });
+          this.logger?.info?.('object is ready after activation');
+        } catch (readError) {
+          this.logger?.warn?.(
+            'read with long polling failed (object may not be ready yet):',
+            safeErrorMessage(readError),
+          );
+          // Continue anyway - return state with activation result
+        }
+
+        return state;
+      }
+
+      // Read and return result (no stateful needed)
+      const readResponse = await readSource(
+        this.connection,
+        config.name,
+        'inactive',
+        undefined,
+        this.logger,
+      );
+      state.readResult = readResponse;
+
+      return state;
+    } catch (error: unknown) {
+      // Cleanup on error - unlock if locked (lockHandle saved for force unlock)
+      if (lockHandle) {
+        try {
+          this.logger?.warn?.(
+            'Unlocking behavior definition during error cleanup',
+          );
+          this.connection.setSessionType('stateful');
+          await unlock(this.connection, config.name, lockHandle);
+          this.connection.setSessionType('stateless');
+        } catch (unlockError) {
+          this.logger?.warn?.(
+            'Failed to unlock during cleanup:',
+            safeErrorMessage(unlockError),
+          );
+        }
+      } else {
+        // Ensure stateless if lock failed
+        this.connection.setSessionType('stateless');
+      }
+
+      if (options?.deleteOnFailure) {
+        try {
+          this.logger?.warn?.('Deleting behavior definition after failure');
+          // No stateful needed - delete doesn't use lock/unlock
+          await deleteBehaviorDefinition(
+            this.connection,
+            config.name,
+            config.transportRequest,
+          );
+        } catch (deleteError) {
+          this.logger?.warn?.(
+            'Failed to delete behavior definition after failure:',
+            safeErrorMessage(deleteError),
+          );
+        }
+      }
+
+      this.logger?.error('Update failed:', safeErrorMessage(error));
+      throw error;
+    }
+  }
+
+  /**
+   * Delete behavior definition
+   */
+  async delete(
+    config: Partial<IBehaviorDefinitionConfig>,
+  ): Promise<IBehaviorDefinitionState> {
+    const state: IBehaviorDefinitionState = { errors: [] };
+    if (!config.name) {
+      const error = new Error('Behavior definition name is required');
+      state.errors.push({ method: 'delete', error, timestamp: new Date() });
+      throw error;
+    }
+
+    try {
+      // Check for deletion (no stateful needed)
+      this.logger?.info?.('Checking behavior definition for deletion');
+      await checkDeletion(this.connection, config.name);
+      this.logger?.info?.('Deletion check passed');
+
+      // Delete (no stateful needed - no lock/unlock)
+      this.logger?.info?.('Deleting behavior definition');
+      const result = await deleteBehaviorDefinition(
+        this.connection,
+        config.name,
+        config.transportRequest,
+      );
+      state.deleteResult = result;
+      this.logger?.info?.('Behavior definition deleted');
+
+      return state;
+    } catch (error: unknown) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      state.errors.push({
+        method: 'delete',
+        error: err,
+        timestamp: new Date(),
+      });
+      this.logger?.error('Delete failed:', safeErrorMessage(err));
+      throw err;
+    }
+  }
+
+  /**
+   * Activate behavior definition
+   * No stateful needed - uses same session/cookies
+   */
+  async activate(
+    config: Partial<IBehaviorDefinitionConfig>,
+  ): Promise<IBehaviorDefinitionState> {
+    const state: IBehaviorDefinitionState = { errors: [] };
+    if (!config.name) {
+      const error = new Error('Behavior definition name is required');
+      state.errors.push({ method: 'activate', error, timestamp: new Date() });
+      throw error;
+    }
+
+    try {
+      const result = await activate(this.connection, config.name);
+      state.activateResult = result;
+      return state;
+    } catch (error: unknown) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      state.errors.push({
+        method: 'activate',
+        error: err,
+        timestamp: new Date(),
+      });
+      this.logger?.error('Activate failed:', safeErrorMessage(err));
+      throw err;
+    }
+  }
+
+  /**
+   * Check behavior definition
+   */
+  async check(
+    config: Partial<IBehaviorDefinitionConfig>,
+    status?: string,
+  ): Promise<IBehaviorDefinitionState> {
+    const state: IBehaviorDefinitionState = { errors: [] };
+    if (!config.name) {
+      const error = new Error('Behavior definition name is required');
+      state.errors.push({ method: 'check', error, timestamp: new Date() });
+      throw error;
+    }
+
+    try {
+      // Map status to version
+      const version: string = status === 'active' ? 'active' : 'inactive';
+      const response = await checkBehaviorDefinition(
+        this.connection,
+        config.name,
+        'bdefImplementationCheck',
+        '',
+        version,
+      );
+      state.checkResult = response;
+      return state;
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      state.errors.push({ method: 'check', error: err, timestamp: new Date() });
+      this.logger?.error('Check failed:', safeErrorMessage(err));
+      throw err;
+    }
+  }
+
+  /**
+   * Lock behavior definition for modification
+   */
+  async lock(config: Partial<IBehaviorDefinitionConfig>): Promise<string> {
+    if (!config.name) {
+      throw new Error('Behavior definition name is required');
+    }
+
+    this.connection.setSessionType('stateful');
+    const lockHandle = await lock(this.connection, config.name);
+    return lockHandle;
+  }
+
+  /**
+   * Unlock behavior definition
+   */
+  async unlock(
+    config: Partial<IBehaviorDefinitionConfig>,
+    lockHandle: string,
+  ): Promise<IBehaviorDefinitionState> {
+    if (!config.name) {
+      throw new Error('Behavior definition name is required');
+    }
+
+    this.connection.setSessionType('stateful');
+    const result = await unlock(this.connection, config.name, lockHandle);
+    this.connection.setSessionType('stateless');
+    return {
+      unlockResult: result,
+      errors: [],
+    };
+  }
+
+  getVersions(config: Partial<IBehaviorDefinitionConfig>) {
+    return getBehaviorDefinitionVersions(this.connection, config);
+  }
+
+  getVersionSource(contentUri: string) {
+    return getBehaviorDefinitionVersionSource(this.connection, contentUri);
+  }
+}
