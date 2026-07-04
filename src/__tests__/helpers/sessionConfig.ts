@@ -1,0 +1,211 @@
+/**
+ * Test configuration helper
+ * Provides SAP configuration from environment variables
+ */
+
+import type { SapConfig } from '@mcp-abap-adt/connection';
+import type { IAbapConnection, ILogger } from '@mcp-abap-adt/interfaces';
+import type { AdtClient, IAdtClientOptions } from '../../clients/AdtClient';
+import { AdtClientLegacy } from '../../clients/AdtClientLegacy';
+import { createAdtClient } from '../../clients/createAdtClient';
+import { getSystemInformation } from '../../utils/systemInfo';
+
+/**
+ * Get connection_type from test-config.yaml environment section.
+ * Returns 'http' (default) or 'rfc'.
+ */
+function getConnectionType(): 'http' | 'rfc' {
+  const { getEnvironmentConfig } = require('./test-helper');
+  try {
+    const envConfig = getEnvironmentConfig();
+    return envConfig.connection_type === 'rfc' ? 'rfc' : 'http';
+  } catch {
+    return 'http';
+  }
+}
+
+/**
+ * Get SAP configuration from environment variables
+ * Used in tests to create connections
+ */
+export function getConfig(): SapConfig {
+  const rawUrl = process.env.SAP_URL;
+  const url = rawUrl ? rawUrl.split('#')[0].trim() : rawUrl;
+  const rawClient = process.env.SAP_CLIENT;
+  const client = rawClient ? rawClient.split('#')[0].trim() : rawClient;
+  const rawAuthType = process.env.SAP_AUTH_TYPE;
+  const authType = rawAuthType
+    ? rawAuthType.split('#')[0].trim().toLowerCase()
+    : '';
+
+  if (!url || !/^https?:\/\//.test(url)) {
+    throw new Error(`Missing or invalid SAP_URL: ${url}`);
+  }
+
+  // RFC transport overrides auth type — RFC connections use username/password
+  // but route through SADT_REST_RFC_ENDPOINT instead of HTTP
+  const connectionType = getConnectionType();
+  if (connectionType === 'rfc') {
+    const username = process.env.SAP_USERNAME;
+    const password = process.env.SAP_PASSWORD;
+    if (!username || !password) {
+      throw new Error(
+        'Missing SAP_USERNAME or SAP_PASSWORD for RFC connection',
+      );
+    }
+    return {
+      url,
+      authType: 'basic',
+      connectionType: 'rfc',
+      client: client || undefined,
+      username,
+      password,
+    };
+  }
+
+  // Keep tests compatible with both modes:
+  // - explicit SAP_AUTH_TYPE (basic|jwt|xsuaa)
+  // - implicit JWT mode when token is provided without SAP_AUTH_TYPE
+  const hasJwtToken = Boolean(process.env.SAP_JWT_TOKEN);
+  const effectiveAuthType: 'basic' | 'jwt' =
+    authType === 'jwt' || authType === 'xsuaa'
+      ? 'jwt'
+      : authType === 'basic'
+        ? 'basic'
+        : hasJwtToken
+          ? 'jwt'
+          : 'basic';
+
+  const config: SapConfig = {
+    url,
+    authType: effectiveAuthType,
+  };
+
+  if (client) {
+    config.client = client;
+  }
+
+  if (effectiveAuthType === 'jwt') {
+    const jwtToken = process.env.SAP_JWT_TOKEN;
+    if (!jwtToken) {
+      throw new Error('Missing SAP_JWT_TOKEN for JWT authentication');
+    }
+    config.jwtToken = jwtToken;
+
+    const refreshToken = process.env.SAP_REFRESH_TOKEN;
+    if (refreshToken) {
+      config.refreshToken = refreshToken;
+    }
+
+    const uaaUrl = process.env.SAP_UAA_URL || process.env.UAA_URL;
+    const uaaClientId =
+      process.env.SAP_UAA_CLIENT_ID || process.env.UAA_CLIENT_ID;
+    const uaaClientSecret =
+      process.env.SAP_UAA_CLIENT_SECRET || process.env.UAA_CLIENT_SECRET;
+
+    if (uaaUrl) config.uaaUrl = uaaUrl;
+    if (uaaClientId) config.uaaClientId = uaaClientId;
+    if (uaaClientSecret) config.uaaClientSecret = uaaClientSecret;
+  } else {
+    const username = process.env.SAP_USERNAME;
+    const password = process.env.SAP_PASSWORD;
+    if (!username || !password) {
+      throw new Error(
+        'Missing SAP_USERNAME or SAP_PASSWORD for basic authentication',
+      );
+    }
+    config.username = username;
+    config.password = password;
+  }
+
+  return config;
+}
+
+/**
+ * Resolve masterSystem/responsible for AdtClient options.
+ * Cloud: from systeminformation endpoint.
+ * On-premise: masterSystem from test-config.yaml, responsible from SAP_USERNAME env var.
+ */
+export async function resolveSystemContext(
+  connection: IAbapConnection,
+  isCloud: boolean,
+): Promise<
+  Pick<
+    IAdtClientOptions,
+    'masterSystem' | 'responsible' | 'unicode' | 'masterLanguage'
+  >
+> {
+  const { getEnvironmentConfig } = require('./test-helper');
+  // Optional master/original language for created objects (e.g. "DE", "ZH").
+  // Empty/undefined → the library defaults to EN. Sourced from test-config so
+  // each system can pin a language it actually has installed.
+  const masterLanguage =
+    getEnvironmentConfig().default_master_language || undefined;
+
+  if (isCloud) {
+    const systemInfo = await getSystemInformation(connection);
+    return {
+      masterSystem: systemInfo?.systemID,
+      responsible: systemInfo?.userName,
+      unicode: true,
+      masterLanguage,
+    };
+  }
+  const envConfig = getEnvironmentConfig();
+  const rawUnicode = process.env.SAP_UNICODE;
+  const unicode = rawUnicode
+    ? rawUnicode.trim().toLowerCase() !== 'false'
+    : undefined;
+  return {
+    masterSystem: envConfig.default_master_system,
+    responsible: process.env.SAP_USERNAME,
+    unicode,
+    masterLanguage,
+  };
+}
+
+/**
+ * Check if test-config.yaml marks the system as legacy (BASIS < 7.50).
+ */
+export function isLegacyEnvironment(): boolean {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { loadTestConfig } = require('./test-helper');
+  const testConfig = loadTestConfig();
+  return testConfig?.environment?.is_legacy === true;
+}
+
+/**
+ * Get connection options for createAbapConnection.
+ * Legacy systems need skipSessionType: true so the x-sap-adt-sessiontype
+ * header is not sent — otherwise locks go to ABAP session memory instead
+ * of the global enqueue server, causing HTTP 423 on subsequent requests.
+ */
+export function getConnectionOptions():
+  | { skipSessionType?: boolean }
+  | undefined {
+  return isLegacyEnvironment() ? { skipSessionType: true } : undefined;
+}
+
+/**
+ * Create the appropriate AdtClient based on system capabilities.
+ * Modern systems (S/4 HANA, BTP) get AdtClient.
+ * Legacy systems (BASIS < 7.50) get AdtClientLegacy.
+ *
+ * Respects is_legacy: true from test-config.yaml to force legacy client
+ * (auto-detection via /sap/bc/adt/core/discovery is unreliable for HTTP
+ * connections to legacy systems — discovery returns XML on any system).
+ */
+export async function createTestAdtClient(
+  connection: IAbapConnection,
+  logger: ILogger,
+  options?: IAdtClientOptions,
+): Promise<{ client: AdtClient; isLegacy: boolean }> {
+  if (isLegacyEnvironment()) {
+    const client = new AdtClientLegacy(connection, logger, options);
+    return { client, isLegacy: true };
+  }
+
+  const client = await createAdtClient(connection, logger, options);
+  const isLegacy = client instanceof AdtClientLegacy;
+  return { client, isLegacy };
+}
